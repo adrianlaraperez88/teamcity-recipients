@@ -1,0 +1,23 @@
+# Log files
+*.log
+robocopy_log.txt
+tmp_out.log
+tmp_err.log
+
+# Temporary / test folders
+test_recipient*
+s3_rec*
+s3_ps_rec*
+tmp/
+temp/
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Environment / local secrets
+.env
+.env.local
+*.local
