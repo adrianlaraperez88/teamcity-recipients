@@ -184,6 +184,25 @@ Run-TestCase "deploy_php.ps1 Update check, configurations and -SkipIis" {
 }
 
 # -------------------------------------------------------------------
+# Test Case 4b: deploy_php.ps1 Installed Version Detection
+# -------------------------------------------------------------------
+Run-TestCase "deploy_php.ps1 Detects Installed PHP Version Correctly" {
+    $existingPhpDir = "C:\php-8.3"
+    if (Test-Path (Join-Path $existingPhpDir "php.exe")) {
+        Write-Host "  Executing against existing PHP installation: $existingPhpDir"
+        $output = powershell.exe -ExecutionPolicy Bypass -File $deployPhpScript -PhpMajorVersion "8.3" -TargetPhpDir $existingPhpDir -RepoConfigDir $mockConfigDir -DryRun -SkipIis 2>&1 | Out-String
+
+        Assert-Contains $output 'Installed : 8.3.32' 'Test 4b'
+        Assert-Contains $output 'Available : 8.3' 'Test 4b'
+        if ($output.Contains('Unable to determine installed PHP version.')) {
+            throw "Test 4b FAILED: Output contained unexpected warning 'Unable to determine installed PHP version.'"
+        }
+    } else {
+        Write-Host "  Skipping active php.exe test because $existingPhpDir was not found."
+    }
+}
+
+# -------------------------------------------------------------------
 # Test Case 5: deploy_s3_cloudfront.bat Multi-Recipient (Dry-Run)
 # -------------------------------------------------------------------
 Run-TestCase "deploy_s3_cloudfront.bat Multi-Recipient CLI Arguments" {

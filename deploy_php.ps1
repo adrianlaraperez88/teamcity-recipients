@@ -155,19 +155,48 @@ Write-TCBlockOpen "2. Determine If Update Required"
 $currentLocalVersion = "0.0.0"
 if (Test-Path $phpExecutable) {
     try {
-        $phpVersionOutput = & $phpExecutable -v
-        if ($phpVersionOutput -match 'PHP\s+(\d+\.\d+\.\d+)') {
+        # Execute php.exe with -n (no php.ini) to avoid extension warnings interfering with version check.
+        # Join output lines to a single string so regex capture groups correctly populate $Matches.
+        $rawVersionOutput = (& $phpExecutable -n -v 2>&1) -join "`n"
+        if ($rawVersionOutput -match 'PHP\s+(\d+\.\d+\.\d+)') {
+            $currentLocalVersion = $Matches[1]
+        } elseif ($rawVersionOutput -match '(\d+\.\d+\.\d+)') {
             $currentLocalVersion = $Matches[1]
         }
     }
     catch {
+        Write-Warning "Failed executing $phpExecutable : $($_.Exception.Message)"
+    }
+
+    # Fallback to FileVersionInfo if CLI execution failed or couldn't parse the version string
+    if ($currentLocalVersion -eq "0.0.0" -or [string]::IsNullOrWhiteSpace($currentLocalVersion)) {
+        try {
+            $fvi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($phpExecutable)
+            $fileVersion = if ($fvi.ProductVersion) { $fvi.ProductVersion } else { $fvi.FileVersion }
+            if ($fileVersion -match '(\d+\.\d+\.\d+)') {
+                $currentLocalVersion = $Matches[1]
+            }
+        }
+        catch {
+            # FileVersionInfo not available
+        }
+    }
+
+    if ($currentLocalVersion -eq "0.0.0" -or [string]::IsNullOrWhiteSpace($currentLocalVersion)) {
         Write-Warning "Unable to determine installed PHP version."
         Write-TCMessage "Unable to determine installed PHP version." "WARNING"
+        $currentLocalVersion = "0.0.0"
     }
 }
 
-$needsCoreUpdate = ([version]$latestPatchVersion -gt [version]$currentLocalVersion)
+$needsCoreUpdate = $false
+try {
+    $needsCoreUpdate = ([version]$latestPatchVersion -gt [version]$currentLocalVersion)
+} catch {
+    $needsCoreUpdate = $true
+}
 if (!(Test-Path $TargetPhpDir)) { $needsCoreUpdate = $true }
+if (!(Test-Path $phpExecutable)) { $needsCoreUpdate = $true }
 if (!(Test-Path (Join-Path $TargetPhpDir "php.ini"))) { $needsCoreUpdate = $true }
 
 if ($needsCoreUpdate) {
@@ -344,7 +373,14 @@ if ($DryRun) {
 } else {
     Write-Host "Installed PHP version:"
     if (Test-Path $phpExecutable) {
-        & $phpExecutable -v
+        try {
+            $verifyOutput = (& $phpExecutable -v 2>&1) -join "`n"
+            Write-Host $verifyOutput
+        }
+        catch {
+            Write-Warning "Unable to execute PHP for version verification: $($_.Exception.Message)"
+            Write-TCMessage "Unable to execute PHP for version verification: $($_.Exception.Message)" "WARNING"
+        }
     } else {
         Write-Warning "PHP executable not found at $phpExecutable."
         Write-TCMessage "PHP executable not found at $phpExecutable." "WARNING"

@@ -39,7 +39,7 @@ object DeployRecipientsBuild : BuildType({
     }
 
     vcs {
-        root(RelativeId("VCS_ROOT_ID")) // Set to your VCS root ID in TeamCity
+        root(DslContext.settingsRoot)
     }
 
     steps {
@@ -74,7 +74,7 @@ object DeployPhpBuild : BuildType({
     }
 
     vcs {
-        root(RelativeId("VCS_ROOT_ID")) // Set to your VCS root ID in TeamCity
+        root(DslContext.settingsRoot)
     }
 
     steps {
@@ -107,7 +107,7 @@ object DeployS3CloudFrontBuild : BuildType({
     }
 
     vcs {
-        root(RelativeId("VCS_ROOT_ID")) // Set to your VCS root ID in TeamCity
+        root(DslContext.settingsRoot)
     }
 
     steps {
