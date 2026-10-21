@@ -1,4 +1,6 @@
-[CmdletBinding()]
+# PositionalBinding disabled so a malformed argument (e.g. 'RepoConfigDir' missing its leading '-')
+# fails immediately instead of silently binding to the wrong parameter.
+[CmdletBinding(PositionalBinding=$false)]
 param(
     [Parameter(Mandatory=$false)]
     [string]$PhpMajorVersion = $env:PHP_MAJOR_VERSION,
@@ -8,6 +10,11 @@ param(
 
     [Parameter(Mandatory=$false)]
     [string]$IisServiceName = "W3SVC",
+
+    # Server on which to stop/start IIS and PHP processes. Defaults to the host of a UNC TargetPhpDir
+    # (e.g. \\WEB01\c$\php\php8.3 -> WEB01), otherwise the local machine.
+    [Parameter(Mandatory=$false)]
+    [string]$IisComputerName = $null,
 
     [Parameter(Mandatory=$false)]
     [string]$RepoConfigDir = $null,
@@ -142,28 +149,44 @@ function Remove-StaleDeploymentFiles([string]$Dir) {
     }
 }
 
-function Get-PhpProcessesInDir([string]$Dir) {
-    $root = $Dir.TrimEnd('\') + '\'
-    Get-CimInstance Win32_Process -Filter "Name LIKE 'php%.exe'" -ErrorAction SilentlyContinue |
+function Get-PhpProcessesInDir([string]$Dir, $CimSession = $null) {
+    $root = ($Dir -replace '/', '\').TrimEnd('\') + '\'
+    $cimArgs = @{ ClassName = 'Win32_Process'; Filter = "Name LIKE 'php%.exe'"; ErrorAction = 'SilentlyContinue' }
+    if ($CimSession) { $cimArgs.CimSession = $CimSession }
+    Get-CimInstance @cimArgs |
         Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase) }
 }
 
-function Stop-PhpProcessesInDir([string]$Dir, [int]$TimeoutSeconds) {
-    $procs = @(Get-PhpProcessesInDir $Dir)
+function Stop-PhpProcessesInDir([string]$Dir, [int]$TimeoutSeconds, $CimSession = $null) {
+    $procs = @(Get-PhpProcessesInDir $Dir $CimSession)
     if ($procs.Count -eq 0) { return }
 
     Write-Host "Waiting up to $TimeoutSeconds s for $($procs.Count) PHP process(es) running from $Dir to exit..."
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline -and @(Get-PhpProcessesInDir $Dir).Count -gt 0) {
+    while ((Get-Date) -lt $deadline -and @(Get-PhpProcessesInDir $Dir $CimSession).Count -gt 0) {
         Start-Sleep -Seconds 1
     }
 
-    $remaining = @(Get-PhpProcessesInDir $Dir)
+    $remaining = @(Get-PhpProcessesInDir $Dir $CimSession)
     foreach ($p in $remaining) {
-        Write-Host " -> Stopping $($p.Name) (PID $($p.ProcessId))"
-        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        Write-Host " -> Terminating $($p.Name) (PID $($p.ProcessId))"
+        Invoke-CimMethod -InputObject $p -MethodName Terminate -ErrorAction SilentlyContinue | Out-Null
     }
     if ($remaining.Count -gt 0) { Start-Sleep -Seconds 2 }
+}
+
+function Get-ServiceController([string]$Name, [string]$Computer) {
+    Add-Type -AssemblyName System.ServiceProcess -ErrorAction SilentlyContinue
+    try {
+        $svc = New-Object System.ServiceProcess.ServiceController($Name, $Computer)
+        $null = $svc.Status   # throws if the service does not exist or is inaccessible
+        return $svc
+    }
+    catch {
+        $script:ServiceLookupError = $_.Exception.InnerException.Message
+        if (-not $script:ServiceLookupError) { $script:ServiceLookupError = $_.Exception.Message }
+        return $null
+    }
 }
 
 # -------------------------------------------------------------------
@@ -174,15 +197,40 @@ $scriptName = $MyInvocation.MyCommand.Name
 if ([string]::IsNullOrEmpty($PhpMajorVersion)) {
     Write-Error "PHP Major Version is required. Either set the environment variable PHP_MAJOR_VERSION or pass -PhpMajorVersion parameter (e.g. -PhpMajorVersion '8.3')."
     Write-Host ""
-    Write-Host "Usage: powershell -File $scriptName [-PhpMajorVersion <version>] [-TargetPhpDir <path>] [-IisServiceName <name>] [-RepoConfigDir <path>] [-SkipIis] [-DryRun]"
+    Write-Host "Usage: powershell -File $scriptName [-PhpMajorVersion <version>] [-TargetPhpDir <path>] [-IisServiceName <name>] [-IisComputerName <server>] [-RepoConfigDir <path>] [-SkipIis] [-DryRun]"
     exit 1
 }
 
 if ([string]::IsNullOrEmpty($TargetPhpDir)) {
     $TargetPhpDir = "C:\PHP\PHP$PhpMajorVersion"
 }
+# Normalise mixed separators (e.g. \\host\c$/php/php8.3)
+$TargetPhpDir = ($TargetPhpDir -replace '/', '\').TrimEnd('\')
 
 $phpExecutable = Join-Path $TargetPhpDir "php.exe"
+
+# Work out which machine actually runs PHP from TargetPhpDir, and the path as seen on that machine.
+#   \\WEB01\c$\php\php8.3  -> host WEB01, local path C:\php\php8.3
+#   \\FS01\share\php8.3    -> host FS01,  local path unknown (not an admin share)
+#   C:\php\php8.3          -> local machine
+$targetHost = $null
+$targetHostLocalDir = $TargetPhpDir
+if ($TargetPhpDir -match '^\\\\([^\\]+)\\([A-Za-z])\$(\\.*)?$') {
+    $targetHost = $Matches[1]
+    $targetHostLocalDir = "$($Matches[2].ToUpper()):$(if ($Matches[3]) { $Matches[3] } else { '\' })"
+} elseif ($TargetPhpDir -match '^\\\\([^\\]+)\\') {
+    $targetHost = $Matches[1]
+    $targetHostLocalDir = $null
+}
+if ($targetHost -and ($targetHost -eq '.' -or $targetHost -eq 'localhost' -or $targetHost -eq $env:COMPUTERNAME)) {
+    $targetHost = $null
+    if (-not $targetHostLocalDir) { $targetHostLocalDir = $TargetPhpDir }
+}
+
+if ([string]::IsNullOrEmpty($IisComputerName)) {
+    $IisComputerName = if ($targetHost) { $targetHost } else { '.' }
+}
+$iisHostLabel = if ($IisComputerName -eq '.') { 'local machine' } else { $IisComputerName }
 
 if ([string]::IsNullOrEmpty($RepoConfigDir)) {
     $hasTeamCityDir = [System.Environment]::GetEnvironmentVariable("TEAMCITY_BUILD_CHECKOUTDIR")
@@ -197,10 +245,16 @@ $repoIniFile = Join-Path $RepoConfigDir "php.ini"
 $repoExtDir  = Join-Path $RepoConfigDir "ext"
 
 # Determine if we should check and manage the IIS service
-$hasIisService = $false
+$iisService = $null
+$iisStoppedByScript = $false
 if (-not $SkipIis) {
-    $hasIisService = Get-Service -Name $IisServiceName -ErrorAction SilentlyContinue
+    $iisService = Get-ServiceController $IisServiceName $IisComputerName
+    if (-not $iisService) {
+        Write-Warning "IIS service '$IisServiceName' not found or not accessible on $iisHostLabel : $($script:ServiceLookupError)"
+        Write-TCMessage "IIS service '$IisServiceName' not found or not accessible on $iisHostLabel." "WARNING"
+    }
 }
+$hasIisService = [bool]$iisService
 
 # Official Windows PHP release API
 $apiUrl = "https://windows.php.net/downloads/releases/releases.json"
@@ -366,34 +420,66 @@ if ($DryRun) {
     if ($SkipIis) {
         Write-Host "[DRY-RUN] IIS service management skipped via -SkipIis."
     } elseif ($hasIisService) {
-        Write-Host "[DRY-RUN] Would stop service $IisServiceName"
+        Write-Host "[DRY-RUN] Would stop service $IisServiceName on $iisHostLabel"
     } else {
-        Write-Host "[DRY-RUN] IIS service ($IisServiceName) not found. Skipping service stop."
+        Write-Host "[DRY-RUN] IIS service ($IisServiceName) not found on $iisHostLabel. Skipping service stop."
     }
 } else {
     if ($hasIisService) {
-        Write-Host "Stopping IIS..."
-        Stop-Service -Name $IisServiceName -Force
+        $iisService.Refresh()
+        if ($iisService.Status -ne 'Stopped') {
+            Write-Host "Stopping IIS ($IisServiceName) on $iisHostLabel..."
+            try {
+                $iisService.Stop()   # also stops dependent services
+                $iisStoppedByScript = $true
+                $iisService.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(120))
+            }
+            catch {
+                Write-Warning "Failed to stop IIS ($IisServiceName) on $iisHostLabel : $($_.Exception.Message)"
+                Write-TCMessage "Failed to stop IIS ($IisServiceName) on $iisHostLabel : $($_.Exception.Message)" "WARNING"
+            }
+        } else {
+            Write-Host "IIS ($IisServiceName) on $iisHostLabel is already stopped."
+        }
     } else {
-        Write-Host "IIS service ($IisServiceName) is not installed or skipped. Skipping service stop."
+        Write-Host "IIS service ($IisServiceName) is not installed or skipped on $iisHostLabel. Skipping service stop."
     }
 }
 
 # Stopping IIS does not wait for FastCGI workers (php-cgi.exe) to exit, and other PHP processes may
-# also hold the binaries open. Only processes on this machine can be detected here.
-if ($DryRun) {
-    $phpProcs = @(Get-PhpProcessesInDir $TargetPhpDir)
-    if ($phpProcs.Count -gt 0) {
-        Write-Host "[DRY-RUN] Would stop $($phpProcs.Count) PHP process(es) running from $TargetPhpDir"
+# also hold the binaries open. Stop them on the machine that runs PHP from TargetPhpDir.
+$phpCimSession = $null
+$canManagePhpProcesses = $true
+if ($targetHost) {
+    if (-not $targetHostLocalDir) {
+        $canManagePhpProcesses = $false
+        Write-Warning "Cannot map $TargetPhpDir to a local path on $targetHost (not an admin share like \\host\c$). Remote PHP processes will not be stopped."
+    } else {
+        try {
+            # DCOM works wherever admin shares do and does not require WinRM
+            $phpCimSession = New-CimSession -ComputerName $targetHost -SessionOption (New-CimSessionOption -Protocol Dcom) -ErrorAction Stop
+        }
+        catch {
+            $canManagePhpProcesses = $false
+            Write-Warning "Unable to connect to $targetHost to manage PHP processes: $($_.Exception.Message)"
+        }
     }
-} else {
-    Stop-PhpProcessesInDir $TargetPhpDir $ProcessExitTimeoutSeconds
 }
 
-if ($TargetPhpDir.StartsWith('\\')) {
-    Write-Warning "Target $TargetPhpDir is a network share. PHP processes on remote servers that load it cannot be stopped from this agent; locked files will be replaced via rename and those servers must recycle IIS to load the new binaries."
-    Write-TCMessage "Target $TargetPhpDir is a network share; remote PHP processes are not stopped by this script." "WARNING"
+if ($canManagePhpProcesses) {
+    if ($DryRun) {
+        $phpProcs = @(Get-PhpProcessesInDir $targetHostLocalDir $phpCimSession)
+        if ($phpProcs.Count -gt 0) {
+            Write-Host "[DRY-RUN] Would stop $($phpProcs.Count) PHP process(es) running from $targetHostLocalDir on $iisHostLabel"
+        }
+    } else {
+        Stop-PhpProcessesInDir $targetHostLocalDir $ProcessExitTimeoutSeconds $phpCimSession
+    }
+} else {
+    Write-Warning "PHP processes using $TargetPhpDir could not be stopped; locked files will be replaced via rename and the server must recycle IIS to load the new binaries."
+    Write-TCMessage "PHP processes using $TargetPhpDir could not be stopped from this agent." "WARNING"
 }
+if ($phpCimSession) { Remove-CimSession $phpCimSession -ErrorAction SilentlyContinue }
 
 try {
     if ($DryRun) {
@@ -481,12 +567,19 @@ finally {
         if ($SkipIis) {
             Write-Host "[DRY-RUN] IIS service management skipped via -SkipIis."
         } elseif ($hasIisService) {
-            Write-Host "[DRY-RUN] Would start service $IisServiceName"
+            Write-Host "[DRY-RUN] Would start service $IisServiceName on $iisHostLabel"
         }
     } else {
-        if ($hasIisService) {
-            Write-Host "Starting IIS..."
-            Start-Service -Name $IisServiceName
+        if ($iisStoppedByScript) {
+            Write-Host "Starting IIS ($IisServiceName) on $iisHostLabel..."
+            try {
+                $iisService.Start()
+                $iisService.WaitForStatus('Running', [TimeSpan]::FromSeconds(120))
+            }
+            catch {
+                Write-TCBuildProblem "Failed to restart IIS ($IisServiceName) on $iisHostLabel : $($_.Exception.Message)"
+                Write-Error "Failed to restart IIS ($IisServiceName) on $iisHostLabel : $($_.Exception.Message)"
+            }
         }
         if (Test-Path $tempExtractPath) { Remove-Item $tempExtractPath -Recurse -Force }
     }
