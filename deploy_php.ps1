@@ -16,7 +16,18 @@ param(
     [switch]$SkipIis,
 
     [Parameter(Mandatory=$false)]
-    [switch]$DryRun
+    [switch]$DryRun,
+
+    # Number of copy attempts for a locked file before moving it aside
+    [Parameter(Mandatory=$false)]
+    [int]$LockRetryCount = 5,
+
+    [Parameter(Mandatory=$false)]
+    [int]$LockRetryDelaySeconds = 3,
+
+    # How long to wait for PHP processes (php-cgi.exe etc.) to exit gracefully before killing them
+    [Parameter(Mandatory=$false)]
+    [int]$ProcessExitTimeoutSeconds = 30
 )
 
 # -------------------------------------------------------------------
@@ -46,6 +57,113 @@ function Write-TCBuildProblem([string]$description) {
         $escaped = $description -replace "'", "|'" -replace "\[", "|[" -replace "\]", "|]"
         Write-Output "##teamcity[buildProblem description='$escaped']"
     }
+}
+
+# -------------------------------------------------------------------
+# LOCKED FILE HANDLING
+# -------------------------------------------------------------------
+# Suffix for in-use files that were renamed out of the way during deployment.
+$script:StaleFileMarker = ".old-deploy-"
+$script:FilesMovedAside = New-Object System.Collections.Generic.List[string]
+
+function Test-IsFileLockError([System.Exception]$ex) {
+    while ($ex) {
+        if ($ex -is [System.IO.IOException]) {
+            # 32 = ERROR_SHARING_VIOLATION, 33 = ERROR_LOCK_VIOLATION
+            $code = $ex.HResult -band 0xFFFF
+            if ($code -eq 32 -or $code -eq 33) { return $true }
+        }
+        $ex = $ex.InnerException
+    }
+    return $false
+}
+
+function Copy-FileWithLockHandling([string]$Source, [string]$Destination) {
+    $destDir = Split-Path $Destination -Parent
+    if (!(Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+
+    for ($attempt = 1; $attempt -le $LockRetryCount; $attempt++) {
+        try {
+            [System.IO.File]::Copy($Source, $Destination, $true)
+            return
+        }
+        catch {
+            if (-not (Test-IsFileLockError $_.Exception)) { throw }
+            if ($attempt -lt $LockRetryCount) {
+                Write-Host "   File in use, retrying in $LockRetryDelaySeconds s ($attempt/$LockRetryCount): $Destination"
+                Start-Sleep -Seconds $LockRetryDelaySeconds
+            }
+        }
+    }
+
+    # Still locked. Windows allows renaming a loaded DLL/EXE even though it cannot be overwritten,
+    # so move the in-use file aside and place the new one at the original path. Running processes
+    # keep using the old image until they restart; the stale copy is removed on the next deployment.
+    $aside = "$Destination$($script:StaleFileMarker)$(Get-Date -Format 'yyyyMMddHHmmss')"
+    try {
+        [System.IO.File]::Move($Destination, $aside)
+    }
+    catch {
+        throw "File '$Destination' is locked by another process and could not be moved aside: $($_.Exception.Message). Stop the processes using it (php-cgi.exe / php.exe / w3wp.exe) on the machine that hosts or loads it, then re-run."
+    }
+
+    try {
+        [System.IO.File]::Copy($Source, $Destination, $true)
+    }
+    catch {
+        # Restore the original so the installation is not left without this file
+        try { [System.IO.File]::Move($aside, $Destination) } catch { }
+        throw
+    }
+
+    Write-Warning "File was in use and was replaced via rename: $Destination"
+    $script:FilesMovedAside.Add($Destination)
+}
+
+function Copy-DirectoryWithLockHandling([string]$SourceDir, [string]$DestinationDir, [string[]]$ExcludeTopLevel = @()) {
+    $srcRoot = (Resolve-Path -LiteralPath $SourceDir).ProviderPath.TrimEnd('\')
+    Get-ChildItem -LiteralPath $srcRoot -Force | Where-Object { $ExcludeTopLevel -notcontains $_.Name } | ForEach-Object {
+        if ($_.PSIsContainer) {
+            Get-ChildItem -LiteralPath $_.FullName -Recurse -File -Force | ForEach-Object {
+                $relative = $_.FullName.Substring($srcRoot.Length + 1)
+                Copy-FileWithLockHandling $_.FullName (Join-Path $DestinationDir $relative)
+            }
+        } else {
+            Copy-FileWithLockHandling $_.FullName (Join-Path $DestinationDir $_.Name)
+        }
+    }
+}
+
+function Remove-StaleDeploymentFiles([string]$Dir) {
+    if (!(Test-Path -LiteralPath $Dir)) { return }
+    Get-ChildItem -LiteralPath $Dir -Recurse -File -Force -Filter "*$($script:StaleFileMarker)*" -ErrorAction SilentlyContinue | ForEach-Object {
+        # Files still loaded by a running process cannot be deleted yet; they will be retried next run.
+        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-PhpProcessesInDir([string]$Dir) {
+    $root = $Dir.TrimEnd('\') + '\'
+    Get-CimInstance Win32_Process -Filter "Name LIKE 'php%.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase) }
+}
+
+function Stop-PhpProcessesInDir([string]$Dir, [int]$TimeoutSeconds) {
+    $procs = @(Get-PhpProcessesInDir $Dir)
+    if ($procs.Count -eq 0) { return }
+
+    Write-Host "Waiting up to $TimeoutSeconds s for $($procs.Count) PHP process(es) running from $Dir to exit..."
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline -and @(Get-PhpProcessesInDir $Dir).Count -gt 0) {
+        Start-Sleep -Seconds 1
+    }
+
+    $remaining = @(Get-PhpProcessesInDir $Dir)
+    foreach ($p in $remaining) {
+        Write-Host " -> Stopping $($p.Name) (PID $($p.ProcessId))"
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    if ($remaining.Count -gt 0) { Start-Sleep -Seconds 2 }
 }
 
 # -------------------------------------------------------------------
@@ -261,6 +379,22 @@ if ($DryRun) {
     }
 }
 
+# Stopping IIS does not wait for FastCGI workers (php-cgi.exe) to exit, and other PHP processes may
+# also hold the binaries open. Only processes on this machine can be detected here.
+if ($DryRun) {
+    $phpProcs = @(Get-PhpProcessesInDir $TargetPhpDir)
+    if ($phpProcs.Count -gt 0) {
+        Write-Host "[DRY-RUN] Would stop $($phpProcs.Count) PHP process(es) running from $TargetPhpDir"
+    }
+} else {
+    Stop-PhpProcessesInDir $TargetPhpDir $ProcessExitTimeoutSeconds
+}
+
+if ($TargetPhpDir.StartsWith('\\')) {
+    Write-Warning "Target $TargetPhpDir is a network share. PHP processes on remote servers that load it cannot be stopped from this agent; locked files will be replaced via rename and those servers must recycle IIS to load the new binaries."
+    Write-TCMessage "Target $TargetPhpDir is a network share; remote PHP processes are not stopped by this script." "WARNING"
+}
+
 try {
     if ($DryRun) {
         Write-Host "[DRY-RUN] Would create directory (if missing): $TargetPhpDir"
@@ -268,6 +402,7 @@ try {
     } else {
         if (!(Test-Path $TargetPhpDir)) { New-Item -ItemType Directory -Path $TargetPhpDir -Force | Out-Null }
         if (!(Test-Path (Join-Path $TargetPhpDir "ext"))) { New-Item -ItemType Directory -Path (Join-Path $TargetPhpDir "ext") -Force | Out-Null }
+        Remove-StaleDeploymentFiles $TargetPhpDir
     }
 
     # ---------------------------------------------------------------
@@ -280,14 +415,10 @@ try {
             Write-Host "[DRY-RUN] Would copy official extension files to $(Join-Path $TargetPhpDir 'ext')"
         } else {
             Write-Host "Deploying PHP binaries..."
-            Get-ChildItem $tempExtractPath | Where-Object { $_.Name -ne "php.ini" -and $_.Name -ne "ext" } | ForEach-Object {
-                Copy-Item $_.FullName $TargetPhpDir -Recurse -Force
-            }
+            Copy-DirectoryWithLockHandling $tempExtractPath $TargetPhpDir @("php.ini", "ext")
 
             Write-Host "Deploying official extensions..."
-            Get-ChildItem (Join-Path $tempExtractPath "ext") | ForEach-Object {
-                Copy-Item $_.FullName (Join-Path $TargetPhpDir "ext") -Force
-            }
+            Copy-DirectoryWithLockHandling (Join-Path $tempExtractPath "ext") (Join-Path $TargetPhpDir "ext")
         }
     }
 
@@ -300,10 +431,7 @@ try {
             Write-Host "[DRY-RUN] Would copy php.ini from $repoIniFile to $(Join-Path $TargetPhpDir 'php.ini')"
         } else {
             Write-Host "Deploying repository php.ini..."
-            Copy-Item `
-                -Path $repoIniFile `
-                -Destination (Join-Path $TargetPhpDir "php.ini") `
-                -Force
+            Copy-FileWithLockHandling $repoIniFile (Join-Path $TargetPhpDir "php.ini")
         }
     } else {
         Write-Warning "Repository php.ini not found at $repoIniFile."
@@ -323,10 +451,7 @@ try {
         } else {
             Write-Host "Deploying custom extensions..."
             Get-ChildItem $repoExtDir -Filter "*.dll" | ForEach-Object {
-                Copy-Item `
-                    $_.FullName `
-                    (Join-Path $TargetPhpDir "ext") `
-                    -Force
+                Copy-FileWithLockHandling $_.FullName (Join-Path (Join-Path $TargetPhpDir "ext") $_.Name)
                 Write-Host " -> $($_.Name)"
             }
         }
@@ -336,6 +461,11 @@ try {
     if ($DryRun) {
         Write-Host "[DRY-RUN] Deployment simulation completed successfully."
     } else {
+        if ($script:FilesMovedAside.Count -gt 0) {
+            $msg = "$($script:FilesMovedAside.Count) file(s) were in use and replaced via rename. Processes still using the old binaries must be restarted (recycle IIS / app pools on every server using $TargetPhpDir)."
+            Write-Warning $msg
+            Write-TCMessage $msg "WARNING"
+        }
         Write-Host "Deployment completed successfully."
     }
 }
